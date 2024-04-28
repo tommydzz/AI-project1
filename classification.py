@@ -2,44 +2,76 @@ import numpy as np
 import matplotlib.pyplot as plt
 import os
 from PIL import Image
-from network import SimpleNeuralNetwork
 from sklearn.model_selection import train_test_split
 
+epoch_losses = []
+epoch_accuracies = []
 
-class ClassificationNeuralNetwork(SimpleNeuralNetwork):
-    def __init__(self, layer_sizes, learning_rate=0.001, beta1=0.9, beta2=0.999, epsilon=1e-8):
-        super().__init__(layer_sizes, learning_rate)
+
+class ClassificationNeuralNetwork:
+    def __init__(self, layer_sizes, learning_rate=0.001, beta1=0.9, beta2=0.999, epsilon=1e-8, dropout_rate=0.2,
+                 l2_lambda=0.001):
+        self.layer_sizes = layer_sizes
+        self.learning_rate = learning_rate
+        self.weights = []
+        self.biases = []
+        for i in range(len(layer_sizes) - 1):
+            self.weights.append(np.random.randn(layer_sizes[i], layer_sizes[i + 1]) * np.sqrt(2. / layer_sizes[i]))
+            self.biases.append(np.zeros((1, layer_sizes[i + 1])))
+        self.activations = []
+        self.loss_history = []
         self.beta1 = beta1
         self.beta2 = beta2
         self.epsilon = epsilon
+        np.random.seed(42)
         self.m = [np.zeros_like(w) for w in self.weights]
         self.v = [np.zeros_like(w) for w in self.weights]
         self.m_bias = [np.zeros_like(b) for b in self.biases]
         self.v_bias = [np.zeros_like(b) for b in self.biases]
         self.t = 0
-    def softmax(self, x):
+        self.dropout_rate = dropout_rate
+        self.dropout_masks = []
+        self.l2_lambda = l2_lambda
+
+    @staticmethod
+    def relu(x):
+        return np.maximum(0, x)
+
+    @staticmethod
+    def relu_derivative(x):
+        return (x > 0).astype(float)
+
+    @staticmethod
+    def softmax(x):
         exp_x = np.exp(x - np.max(x, axis=1, keepdims=True))
         return exp_x / np.sum(exp_x, axis=1, keepdims=True)
 
-    def sigmoid(self, z):
+    @staticmethod
+    def sigmoid(z):
         return 1 / (1 + np.exp(-z))
 
     def sigmoid_derivative(self, z):
         sig = self.sigmoid(z)
         return sig * (1 - sig)
 
-    def forward(self, x):
+    def forward(self, x, is_training=True):
         self.activations = [x]
         for i in range(len(self.weights) - 1):
             z = self.activations[-1].dot(self.weights[i]) + self.biases[i]
             a = self.relu(z)
+            if is_training:
+                # 应用Dropout
+                a, mask = dropout_forward(a, self.dropout_rate)
+                self.dropout_masks.append(mask)
             self.activations.append(a)
+
+        # 最后一层不使用Dropout
         z = self.activations[-1].dot(self.weights[-1]) + self.biases[-1]
         output = self.softmax(z)
         self.activations.append(output)
         return output
 
-    def backward(self, x, y_true):
+    def backward(self, y_true):
         self.t += 1  # Increment time step for Adam
         y_pred = self.activations[-1]
         delta = y_pred - y_true
@@ -75,29 +107,60 @@ class ClassificationNeuralNetwork(SimpleNeuralNetwork):
             m_hat_bias = self.m_bias[i] / (1 - self.beta1 ** self.t)
             v_hat_bias = self.v_bias[i] / (1 - self.beta2 ** self.t)
             self.biases[i] -= self.learning_rate * m_hat_bias / (np.sqrt(v_hat_bias) + self.epsilon)
+
     def compute_loss(self, y_pred, y_true):
         m = y_true.shape[0]
-        epsilon = 1e-9  # 小常数，防止计算对数0
-        y_pred = np.clip(y_pred, epsilon, 1 - epsilon)  # 将预测值限制在[epsilon, 1-epsilon]区间内
-        log_likelihood = -np.log(y_pred[range(m), y_true.argmax(axis=1)])
-        loss = np.sum(log_likelihood) / m
+        epsilon = 1e-9  # 防止计算log(0)
+        y_pred = np.clip(y_pred, epsilon, 1 - epsilon)
+        log_likelihood = -np.log(y_pred[np.arange(m), y_true.argmax(axis=1)])
+        l2_penalty = sum([(w ** 2).sum() for w in self.weights])  # L2
+        loss = np.sum(log_likelihood) / m + self.l2_lambda * l2_penalty
         return loss
 
+    def train(self, x_train, y_train, x_test, y_test, epochs, batch_size):
+        num_samples = x_train.shape[0]
 
-    def train(self, x, y, epochs):
         for epoch in range(epochs):
-            y_pred = self.forward(x)
-            loss = self.compute_loss(y_pred, y)
-            self.loss_history.append(loss)
-            self.backward(x, y)
-            if epoch % 100 == 0:
-                print(f"Epoch {epoch}, Loss: {loss}")
+            indices = np.arange(num_samples)
+            np.random.shuffle(indices)
+            x_train = x_train[indices]
+            y_train = y_train[indices]
+
+            epoch_loss = 0
+            batches_processed = 0
+
+            for start_idx in range(0, num_samples, batch_size):
+                end_idx = min(start_idx + batch_size, num_samples)
+                if start_idx == end_idx:
+                    continue
+                batch_x = x_train[start_idx:end_idx]
+                batch_y = y_train[start_idx:end_idx]
+
+                y_pred = self.forward(batch_x, is_training=True)
+                loss = self.compute_loss(y_pred, batch_y)
+                self.loss_history.append(loss)
+
+                epoch_loss += loss
+                batches_processed += 1
+
+                self.backward(batch_y)
+
+            if batches_processed > 0:
+                average_epoch_loss = epoch_loss / batches_processed
+            else:
+                average_epoch_loss = None
+
+            epoch_losses.append(average_epoch_loss)
+
+            accuracy = evaluate_model(self, x_test, y_test)
+            epoch_accuracies.append(accuracy)
+            print(f"Epoch {epoch}, Average Loss: {average_epoch_loss}, Accuracy: {accuracy}")
 
 
 def load_and_process_images(base_dir, img_size=(28, 28)):
     images = []
     labels = []
-    for label in range(1, 13):  # 对于每一个类别
+    for label in range(1, 13):
         folder_path = os.path.join(base_dir, str(label))
         for img_name in os.listdir(folder_path):
             img_path = os.path.join(folder_path, img_name)
@@ -106,48 +169,67 @@ def load_and_process_images(base_dir, img_size=(28, 28)):
                 img_resized = img.resize(img_size).convert('L')  # 调整大小并转换为灰度图
                 img_array = np.array(img_resized) / 255.0  # 归一化
                 images.append(img_array)
-                labels.append(label - 1)  # 标签从0开始
+                labels.append(label - 1)
 
     return np.array(images), np.array(labels)
 
 
-def evaluate_model(network, X_test, Y_test):
-    predictions = network.forward(X_test)
+def dropout_forward(x, dropout_rate):
+    if dropout_rate > 0:
+        mask = np.random.binomial(1, 1 - dropout_rate, size=x.shape) / (1 - dropout_rate)
+        return x * mask, mask
+    return x, None
+
+
+def dropout_backward(dout, mask, dropout_rate):
+    if dropout_rate > 0:
+        return dout * mask
+    return dout
+
+
+def evaluate_model(network, x_test, y_test, is_training=False):
+    predictions = network.forward(x_test, is_training)
     predicted_classes = np.argmax(predictions, axis=1)
-    true_classes = np.argmax(Y_test, axis=1)
+    true_classes = np.argmax(y_test, axis=1)
     accuracy = np.mean(predicted_classes == true_classes)
     return accuracy
 
 
 def to_categorical(y, num_classes):
-    """ 将标签向量转换为one-hot编码的矩阵 """
+    # one hot
     return np.eye(num_classes)[y]
 
 
 if __name__ == '__main__':
-    images, labels = load_and_process_images(base_dir='.\\train')
-    # 假设`images`和`labels`是从之前的load_and_process_images函数中获得的
-    X = images.reshape(images.shape[0], -1)  # 展平图片数据
-    Y = to_categorical(labels, 12)  # 转换标签为one-hot编码，12分类任务
+    Images, Labels = load_and_process_images(base_dir='.\\train')
+    X = Images.reshape(Images.shape[0], -1)
+    Y = to_categorical(Labels, 12)
 
-    # 划分数据集
+    # Split
     X_train, X_test, Y_train, Y_test = train_test_split(X, Y, test_size=0.2, random_state=42)
-    input_size = 28 * 28  # 图片大小为28x28
-    output_size = 12  # 12个类别
-    hidden_layers = [128, 64]  # 隐藏层的大小
-    layer_sizes = [input_size] + hidden_layers + [output_size]
+    input_size = 28 * 28
+    output_size = 12
+    hidden_layers = [150, 75]
+    Layer_sizes = [input_size] + hidden_layers + [output_size]
 
-    # 初始化网络
-    nn = ClassificationNeuralNetwork(layer_sizes, learning_rate=0.0001)
+    nn = ClassificationNeuralNetwork(Layer_sizes, learning_rate=0.0001, beta1=0.9, beta2=0.999, epsilon=1e-8,
+                                     dropout_rate=0.2)
 
-    # 训练网络
-    nn.train(X_train, Y_train, epochs=5000)
-    plt.plot(nn.loss_history)
-    plt.title('Loss over epochs')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
+    nn.train(X_train, Y_train, X_test, Y_test, epochs=200, batch_size=64)
+    fig, ax1 = plt.subplots(figsize=(10, 5))
+
+    color = 'tab:red'
+    ax1.set_xlabel('Epoch')
+    ax1.set_ylabel('Loss', color=color)
+    ax1.plot(epoch_losses, label='Training Loss', color=color)
+    ax1.tick_params(axis='y', labelcolor=color)
+
+    ax2 = ax1.twinx()
+    color = 'tab:blue'
+    ax2.set_ylabel('Accuracy', color=color)
+    ax2.plot(epoch_accuracies, label='Training Accuracy', color=color)
+    ax2.tick_params(axis='y', labelcolor=color)
+
+    fig.tight_layout()
+    plt.title('Training Loss and Accuracy')
     plt.show()
-
-    # 计算测试集上的准确率
-    accuracy = evaluate_model(nn, X_test, Y_test)
-    print(f"Test Accuracy: {accuracy:.2f}")
